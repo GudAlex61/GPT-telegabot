@@ -32,16 +32,16 @@ dp = Dispatcher()
 
 # Доступные модели (бесплатные)
 AVAILABLE_MODELS = {
-    "Deepseek-V3": "deepseek/deepseek-chat-v3-0324",
-    "Deepseek-R1": "deepseek/deepseek-r1-0528",
-    "Qwen3-coder": "qwen/qwen3-coder",
-    "Gemini-2.0-flash": "google/gemini-2.0-flash-exp",
-    "Qwen3": "qwen/qwen3-235b-a22b",
+    "Deepseek-V3": "deepseek/deepseek-chat-v3-0324:free",
+    "Deepseek-R1": "deepseek/deepseek-r1-0528:free",
+    "Qwen3-coder": "qwen/qwen3-coder:free",
+    "Gemini-2.0-flash": "google/gemini-2.0-flash-exp:free",
+    "Qwen3": "qwen/qwen3-235b-a22b:free",
     "GPT-4o mini": "openai/gpt-4o-mini"
 }
 
 # Модель по умолчанию
-DEFAULT_MODEL = "deepseek/deepseek-chat-v3-0324"
+DEFAULT_MODEL = "deepseek/deepseek-chat-v3-0324:free"
 
 # Хранилище выбранных моделей (в памяти)
 user_models = {}
