@@ -24,7 +24,7 @@ if not env_path.exists():
 load_dotenv(env_path)
 
 API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY2')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY3')
 
 # Настройка бота
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -32,15 +32,16 @@ dp = Dispatcher()
 
 # Доступные модели (бесплатные)
 AVAILABLE_MODELS = {
-    "deepseek-chat": "deepseek/deepseek-chat-v3-0324",
-    "qwen3-coder": "qwen/qwen3-coder",
-    "deepseek-r1": "deepseek/deepseek-r1-0528",
-    "gemini": "google/gemini-2.0-flash-exp",
-    "qwen3": "qwen/qwen3-235b-a22b",
+    "Deepseek-V3": "deepseek/deepseek-chat-v3-0324",
+    "Deepseek-R1": "deepseek/deepseek-r1-0528",
+    "Qwen3-coder": "qwen/qwen3-coder",
+    "Gemini-2.0-flash": "google/gemini-2.0-flash-exp",
+    "Qwen3": "qwen/qwen3-235b-a22b",
+    "GPT-4o mini": "openai/gpt-4o-mini"
 }
 
 # Модель по умолчанию
-DEFAULT_MODEL = "deepseek/deepseek-chat"
+DEFAULT_MODEL = "deepseek/deepseek-chat-v3-0324"
 
 # Хранилище выбранных моделей (в памяти)
 user_models = {}
