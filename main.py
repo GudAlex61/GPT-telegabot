@@ -5,6 +5,7 @@ import json
 import re
 import html
 import base64
+from pylatexenc.latex2text import LatexNodes2Text
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
@@ -15,6 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand, BotCommandScopeDefault, URLInputFile
 import asyncio
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from PIL import Image  # Добавлено для обработки изображений
 
 # Проверка и загрузка .env
 env_path = Path('.') / '.env'
@@ -28,7 +30,12 @@ if not env_path.exists():
 load_dotenv(env_path)
 
 API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY3')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+
+# Добавлены параметры для оптимизации изображений
+IMAGE_MAX_SIZE = 1024  # Максимальный размер изображения
+IMAGE_QUALITY = 75    # Качество сжатия JPEG (1-100)
+IMAGE_FORMAT = "JPEG" # Формат для сжатия
 
 # Проверка наличия ключей
 if not API_TOKEN or not OPENROUTER_API_KEY:
@@ -76,182 +83,7 @@ user_models = {}
 
 
 def convert_markdown_to_html(text: str) -> str:
-    """Конвертирует Markdown-разметку в HTML-теги"""
-    # Экранируем HTML-символы
-    text = html.escape(text)
-    
-    # Обрабатываем блоки кода с указанием языка
-    text = re.sub(
-        r'```(\w+)?\s*\n(.+?)```', 
-        r'<pre><code>\2</code></pre>', 
-        text, 
-        flags=re.DOTALL
-    )
-    
-    # Обрабатываем блоки кода без указания языка
-    text = re.sub(
-        r'```([^`]+?)```', 
-        r'<pre><code>\1</code></pre>', 
-        text, 
-        flags=re.DOTALL
-    )
-    
-    # Обрабатываем инлайн-код
-    text = re.sub(
-        r'`([^`]+?)`', 
-        r'<code>\1</code>', 
-        text
-    )
-    
-    # Жирный текст
-    text = re.sub(
-        r'\*\*([^*]+?)\*\*', 
-        r'<b>\1</b>', 
-        text
-    )
-    
-    # Курсив
-    text = re.sub(
-        r'\*([^*]+?)\*', 
-        r'<i>\1</i>', 
-        text
-    )
-    
-    # Обработка заголовков H1-H6
-    # H1: # Заголовок
-    text = re.sub(
-        r'^# (.+)$', 
-        r'<b><u>\1</u></b>', 
-        text, 
-        flags=re.MULTILINE
-    )
-    
-    # H3: ### Заголовок
-    text = re.sub(
-        r'^### (.+)$', 
-        r'<b>\1</b>', 
-        text, 
-        flags=re.MULTILINE
-    )
-
-        # Специальные математические символы (добавляем пробелы для лучшей читаемости)
-    math_symbols = {
-        r'\\int': '∫',
-        r'\\sum': '∑',
-        r'\\prod': '∏',
-        r'\\pm': '±',
-        r'\\mp': '∓',
-        r'\\infty': '∞',
-        r'\\cdot': '·',
-        r'\\times': '×',
-        r'\\div': '÷',
-        r'\\sqrt': '√',
-        r'\\pi': 'π',
-        r'\\alpha': 'α',
-        r'\\beta': 'β',
-        r'\\gamma': 'γ',
-        r'\\delta': 'δ',
-        r'\\epsilon': 'ε',
-        r'\\zeta': 'ζ',
-        r'\\eta': 'η',
-        r'\\theta': 'θ',
-        r'\\lambda': 'λ',
-        r'\\mu': 'μ',
-        r'\\xi': 'ξ',
-        r'\\rho': 'ρ',
-        r'\\sigma': 'σ',
-        r'\\tau': 'τ',
-        r'\\phi': 'φ',
-        r'\\psi': 'ψ',
-        r'\\omega': 'ω',
-        r'\\Delta': 'Δ',
-        r'\\Gamma': 'Γ',
-        r'\\Theta': 'Θ',
-        r'\\Lambda': 'Λ',
-        r'\\Sigma': 'Σ',
-        r'\\Phi': 'Φ',
-        r'\\Psi': 'Ψ',
-        r'\\Omega': 'Ω',
-        r'\\partial': '∂',
-        r'\\nabla': '∇',
-        r'\\forall': '∀',
-        r'\\exists': '∃',
-        r'\\nexists': '∄',
-        r'\\emptyset': '∅',
-        r'\\in': '∈',
-        r'\\notin': '∉',
-        r'\\subset': '⊂',
-        r'\\supset': '⊃',
-        r'\\subseteq': '⊆',
-        r'\\supseteq': '⊇',
-        r'\\cap': '∩',
-        r'\\cup': '∪',
-        r'\\land': '∧',
-        r'\\lor': '∨',
-        r'\\neg': '¬',
-        r'\\equiv': '≡',
-        r'\\approx': '≈',
-        r'\\propto': '∝',
-        r'\\perp': '⊥',
-        r'\\angle': '∠',
-        r'\\therefore': '∴',
-        r'\\because': '∵',
-    }
-    
-    for pattern, replacement in math_symbols.items():
-        text = re.sub(pattern, replacement, text)
-    
-    # Дроби вида \frac{a}{b} → a/b
-    text = re.sub(
-        r'\\frac\s*{([^}]+)}\s*{([^}]+)}', 
-        r'<i>\1</i>/<i>\2</i>', 
-        text
-    )
-    
-    # Интегралы с пределами
-    text = re.sub(
-        r'\\int\s*_{([^}]+)}\s*^{([^}]+)}', 
-        r'∫<sub>\1</sub><sup>\2</sup>', 
-        text
-    )
-    
-    # Суммы и произведения с пределами
-    text = re.sub(
-        r'\\sum\s*_{([^}]+)}\s*^{([^}]+)}', 
-        r'∑<sub>\1</sub><sup>\2</sup>', 
-        text
-    )
-    
-    text = re.sub(
-        r'\\prod\s*_{([^}]+)}\s*^{([^}]+)}', 
-        r'∏<sub>\1</sub><sup>\2</sup>', 
-        text
-    )
-    
-    # Индексы и степени
-    text = re.sub(
-        r'\^(\w+)', 
-        r'<sup>\1</sup>', 
-        text
-    )
-    
-    text = re.sub(
-        r'_(\w+)', 
-        r'<sub>\1</sub>', 
-        text
-    )
-    
-    # Греческие буквы и другие символы в тексте
-    text = re.sub(
-        r'\\text\s*{([^}]+)}', 
-        r'\1', 
-        text
-    )
-    
-    # Добавляем пробелы вокруг операторов для лучшей читаемости
-    operators = [r'\+', r'-', r'=', r'<', r'>', r'\\leq', r'\\geq', r'\\neq']
-    for op in operators:
-        text = re.sub(f'({op})', r' \1 ', text)
+    text = LatexNodes2Text().latex_to_text(text)
     
     return text
 
@@ -272,6 +104,35 @@ def get_model_support_images(model_id):
         if data["id"] == model_id:
             return data["image_support"]
     return False
+
+# Функция для сжатия изображения
+def compress_image(image_data: bytes) -> bytes:
+    """Сжимает изображение до оптимального размера"""
+    try:
+        img = Image.open(BytesIO(image_data))
+        
+        # Конвертируем в RGB, если нужно
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        
+        # Рассчитываем новые размеры с сохранением пропорций
+        width, height = img.size
+        max_dim = max(width, height)
+        
+        if max_dim > IMAGE_MAX_SIZE:
+            ratio = IMAGE_MAX_SIZE / max_dim
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+        
+        # Сохраняем с оптимизированными параметрами
+        output_buffer = BytesIO()
+        img.save(output_buffer, format=IMAGE_FORMAT, quality=IMAGE_QUALITY, optimize=True)
+        return output_buffer.getvalue()
+    
+    except Exception as e:
+        logging.error(f"Ошибка сжатия изображения: {str(e)}")
+        return image_data  # Возвращаем оригинал в случае ошибки
 
 
 async def set_main_menu():
@@ -526,8 +387,11 @@ async def handle_photo(message: types.Message):
     file = await bot.get_file(photo.file_id)
     image_data = await bot.download_file(file.file_path)
     
-    # Обрабатываем изображение
-    await process_image_message(message, image_data.read(), message.caption)
+    # Сжимаем изображение перед обработкой
+    compressed_image = compress_image(image_data.read())
+    
+    # Обрабатываем сжатое изображение
+    await process_image_message(message, compressed_image, message.caption)
 
 
 @dp.message()
@@ -620,6 +484,10 @@ async def main():
     for name, data in AVAILABLE_MODELS.items():
         if data["image_support"]:
             print(f"  - {name}")
+    print(f"\n⚙️ Параметры оптимизации изображений:")
+    print(f"  Максимальный размер: {IMAGE_MAX_SIZE}px")
+    print(f"  Качество сжатия: {IMAGE_QUALITY}%")
+    print(f"  Формат: {IMAGE_FORMAT}")
     await dp.start_polling(bot)
 
 
