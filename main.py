@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-main.py — Telegram bot with Cloudflare R2 (S3) integration.
-Uploads compressed JPEG to S3, generates presigned GET URL and sends that url
-to multimodal models that support image_url. No inline/base64 fallback.
-Auto-delete of S3 objects optionally supported.
-"""
 
 import logging
 import aiohttp
 import os
-import base64
-from pylatexenc.latex2text import LatexNodes2Text
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
@@ -29,7 +21,6 @@ from uuid import uuid4
 import boto3
 from botocore.client import Config
 from concurrent.futures import ThreadPoolExecutor
-import re
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -103,23 +94,171 @@ def convert_markdown_to_html(text: str) -> str:
 
     import re
 
-    # Сначала экранируем HTML символы
+    math_blocks = []
+    math_inlines = []
+
+    def save_math_block(match):
+        placeholder = f"{{MATH_BLOCK_{len(math_blocks)}}}"
+        math_content = match.group(1)
+        math_content = replace_math_symbols(math_content)
+        math_blocks.append(math_content)
+        return placeholder
+
+    text = re.sub(r'\\\[(.*?)\\\]', save_math_block, text, flags=re.DOTALL)
+
+    def save_math_inline(match):
+        placeholder = f"{{MATH_INLINE_{len(math_inlines)}}}"
+        math_content = match.group(1)
+        math_content = replace_math_symbols(math_content)
+        math_inlines.append(math_content)
+        return placeholder
+
+    text = re.sub(r'\\\((.*?)\\\)', save_math_inline, text, flags=re.DOTALL)
+
     text = text.replace('&', '&amp;').replace('<', '<').replace('>', '>')
 
-    # Заменяем markdown на HTML теги
-    # Жирный текст **text** или __text__
+    for i, math_block in enumerate(math_blocks):
+        text = text.replace(f'{{MATH_BLOCK_{i}}}', f'<pre><code>{math_block}</code></pre>')
+
+    for i, math_inlines in enumerate(math_inlines):
+        text = text.replace(f'{{MATH_INLINE_{i}}}', f'<code>{math_inlines}</code>')
+
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(.*?)__', r'<b>\1</b>', text)
-
-    # Курсив *text* или _text_ (с проверкой на парность)
     text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
     text = re.sub(r'_(.*?)_', r'<i>\1</i>', text)
-
-    # Моноширинный текст `code`
     text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
-
-    # Блоки кода ```code```
     text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+
+    return text
+
+
+def replace_math_symbols(text: str) -> str:
+    import re
+
+    text = re.sub(r'√\(-frac\{(.*?)\)\{(.*?)\}\}', lambda m: f"√(-({m.group(1)}/{m.group(2)}))", text)
+
+    text = text.replace(r'\int', '∫')
+    text = text.replace(r'\ln', 'ln')
+
+    def sqrt_replace(match):
+        content = match.group(1)
+        return f"√({content})"
+
+    text = re.sub(r'\\sqrt\{(.*?)\}', sqrt_replace, text)
+
+    def frac_replace(match):
+        numerator = match.group(1)
+        denominator = match.group(2)
+        return f"({numerator}/{denominator})"
+
+    text = re.sub(r'\\frac\{(.*?)\}\{(.*?)\}', frac_replace, text)
+
+    text = re.sub(r'-frac\{(.*?)\)\{(.*?)\}', lambda m: f"-({m.group(1)}/{m.group(2)})", text)
+
+    text = re.sub(r'-frac\{(.*?)\}\{(.*?)\}', lambda m: f"-({m.group(1)}/{m.group(2)})", text)
+
+    text = re.sub(r'\^2', '²', text)
+
+    def text_replace(match):
+        content = match.group(1)
+        return content
+
+    text = re.sub(r'\\text\{(.*?)\}', text_replace, text)
+
+
+    text = text.replace(r'\quad', '  ')
+    text = text.replace(r'\,', ' ')
+    text = text.replace(r'\!', '')
+    text = text.replace(r'\;', '')
+    text = text.replace(r'\:', '')
+
+    text = re.sub(r'\\left\s*\(', '(', text)
+    text = re.sub(r'\\right\)', ')', text)
+    text = re.sub(r'\\left\s*\[', '[', text)
+    text = re.sub(r'\\right\]', ']', text)
+    text = re.sub(r'\\left\s*\{', '{', text)
+    text = re.sub(r'\\right\}', '}', text)
+    text = re.sub(r'\\left\s*\|', '|', text)
+    text = re.sub(r'\\right\s*\|', '|', text)
+    text = re.sub(r'\\left\s*\\', '', text)
+    text = re.sub(r'\\right\s*\\', '', text)
+    text = re.sub(r'\\left\s*\.', '', text)
+    text = re.sub(r'\\right\s*\.', '', text)
+    text = re.sub(r'\\left\s*', '', text)
+    text = re.sub(r'\\right\s*', '', text)
+
+    def exp_replace(match):
+        content = match.group(1)
+        return f"e^({content})"
+
+    text = re.sub(r'e\^\{(.*?)\}', exp_replace, text)
+
+    def power_replace(match):
+        content = match.group(1)
+        return f"^({content})"
+
+    text = re.sub(r'\^\{(.*?)\}', power_replace, text)
+
+    def x_power_replace(match):
+        content = match.group(1)
+        return f"x^({content})"
+
+    text = re.sub(r'x\^\{(.*?)\}', x_power_replace, text)
+
+    text = text.replace(r'\infty', '∞')
+    text = text.replace(r'\pm', '±')
+    text = text.replace(r'\times', '×')
+    text = text.replace(r'\div', '÷')
+    text = text.replace(r'\leq', '≤')
+    text = text.replace(r'\geq', '≥')
+    text = text.replace(r'\neq', '≠')
+    text = text.replace(r'\approx', '≈')
+    text = text.replace(r'\cap', '∩')
+    text = text.replace(r'\cup', '∪')
+    text = text.replace(r'\subset', '⊂')
+    text = text.replace(r'\subseteq', '⊆')
+    text = text.replace(r'\in', '∈')
+    text = text.replace(r'\notin', '∉')
+    text = text.replace(r'\emptyset', '∅')
+    text = text.replace(r'\forall', '∀')
+    text = text.replace(r'\exists', '∃')
+    text = text.replace(r'\nexists', '∄')
+    text = text.replace(r'\sum', '∑')
+    text = text.replace(r'\prod', '∏')
+    text = text.replace(r'\lim', 'lim')
+    text = text.replace(r'\to', '→')
+    text = text.replace(r'\rightarrow', '→')
+    text = text.replace(r'\leftarrow', '←')
+    text = text.replace(r'\Rightarrow', '⇒')
+    text = text.replace(r'\Leftrightarrow', '⇔')
+    text = text.replace(r'\cdot', '·')
+    text = text.replace(r'\ldots', '…')
+    text = text.replace(r'\vdots', '⋮')
+    text = text.replace(r'\cdots', '⋯')
+    text = text.replace(r'\ddots', '⋱')
+
+    greek_letters = {
+        r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+        r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
+        r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
+        r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
+        r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
+        r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
+        r'\Alpha': 'Α', r'\Beta': 'Β', r'\Gamma': 'Γ', r'\Delta': 'Δ',
+        r'\Epsilon': 'Ε', r'\Zeta': 'Ζ', r'\Eta': 'Η', r'\Theta': 'Θ',
+        r'\Iota': 'Ι', r'\Kappa': 'Κ', r'\Lambda': 'Λ', r'\Mu': 'Μ',
+        r'\Nu': 'Ν', r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Rho': 'Ρ',
+        r'\Sigma': 'Σ', r'\Tau': 'Τ', r'\Upsilon': 'Υ', r'\Phi': 'Φ',
+        r'\Chi': 'Χ', r'\Psi': 'Ψ', r'\Omega': 'Ω'
+    }
+
+    for latex_cmd, symbol in greek_letters.items():
+        text = text.replace(latex_cmd, symbol)
+
+    text = re.sub(r'([a-zA-Z])_([0-9])', lambda m: f"{m.group(1)}{chr(0x2080 + int(m.group(2)))}", text)
+
+    text = re.sub(r'\\([a-zA-Z]+)', r'\1', text)
 
     return text
 
@@ -190,10 +329,8 @@ async def extract_text_from_image(image_bytes: bytes) -> Optional[str]:
     Использует OCR модель для извлечения текста из изображения
     """
     try:
-        # Сжимаем изображение для OCR (можем быть менее требовательны к качеству)
         jpeg_bytes = compress_image_high_quality(image_bytes, max_side=1024, quality=85)
 
-        # Загружаем в S3 для OCR
         key = f"ocr_uploads/{uuid4().hex}.jpg"
         presigned_url = await upload_bytes_to_s3_and_get_presigned_url(jpeg_bytes, key, expires=S3_PRESIGNED_EXPIRATION)
 
@@ -201,11 +338,9 @@ async def extract_text_from_image(image_bytes: bytes) -> Optional[str]:
             logging.error("Failed to upload image for OCR")
             return None
 
-        # Назначаем авто-удаление
         if S3_AUTO_DELETE_AFTER > 0:
             await schedule_s3_delete(key, delay=S3_AUTO_DELETE_AFTER)
 
-        # Отправляем запрос к OCR модели
         content = [
             {"type": "text", "text": "Extract all text from this image. Return only the text content, nothing else."},
             {"type": "image_url", "image_url": {"url": presigned_url}}
@@ -230,7 +365,6 @@ async def extract_text_from_image(image_bytes: bytes) -> Optional[str]:
                     logging.error(f"OCR OpenRouter returned non-json: status={resp.status} text={text[:400]}")
                     return None
 
-                # Проверяем ошибки
                 if 'error' in data:
                     logging.error(f"OCR Error: {data['error']}")
                     return None
@@ -253,9 +387,6 @@ _s3_client = None
 
 
 def _make_s3_client_sync():
-    """
-    Create and return a boto3 S3 client (sync). Called inside thread executor.
-    """
     global _s3_client
     if _s3_client is None:
         config = Config(signature_version='s3v4')
@@ -383,11 +514,9 @@ async def show_models_keyboard(message: types.Message, user_id: int, edit: bool 
 
     if edit:
         try:
-            # Получаем текущие текст и разметку сообщения
             current_text = message.html_text
             current_markup = message.reply_markup
 
-            # Проверяем, есть ли изменения
             if new_text != current_text or str(new_markup) != str(current_markup):
                 await message.edit_text(new_text, reply_markup=new_markup)
             else:
@@ -431,9 +560,6 @@ async def current_model(m: types.Message):
 
 @dp.message(Command("upload_test"))
 async def cmd_upload_test(m: types.Message):
-    """
-    Test: sends a public image URL (Wikimedia) to the selected model to compare usage.
-    """
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/1024px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg  "
     model_id = get_user_model(m.from_user.id)
     if not get_model_support_images(model_id):
@@ -484,7 +610,7 @@ async def process_image_with_ocr(message: types.Message, image_bytes: bytes, cap
         try:
             await status_msg.edit_text("<i>🔍 Распознаю текст на изображении...</i>")
         except Exception:
-            pass  # Сообщение уже удалено или не существует
+            pass
 
         extracted_text = await extract_text_from_image(image_bytes)
 
@@ -503,7 +629,7 @@ async def process_image_with_ocr(message: types.Message, image_bytes: bytes, cap
         try:
             await status_msg.edit_text("<i>🤖 Обрабатываю извлеченный текст...</i>")
         except Exception:
-            pass  # Сообщение уже удалено или не существует
+            pass
 
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         payload = {"model": model_id, "messages": [{"role": "user", "content": prompt}]}
@@ -545,7 +671,7 @@ async def process_image_with_ocr(message: types.Message, image_bytes: bytes, cap
         try:
             await try_delete_message(status_msg)
         except Exception:
-            pass  # Сообщение уже удалено - это нормально
+            pass
 
         model_name = escape_html(get_model_name(model_id))
         response_text = f"🧠 <b>{model_name}</b>:\n\n{formatted}"
@@ -561,23 +687,19 @@ async def process_image_with_ocr(message: types.Message, image_bytes: bytes, cap
         try:
             await try_delete_message(status_msg)
         except Exception:
-            pass  # Сообщение уже удалено - это нормально
+            pass
         await message.answer(f"🚫 Ошибка при обработке изображения через OCR: {str(e)}")
 
 
 async def process_image_directly(message: types.Message, image_bytes: bytes, caption: str, model_id: str, status_msg):
-    """Отправляет изображение напрямую в модель, поддерживающую изображения"""
     try:
-        # compress to high-quality JPEG
         jpeg_bytes = compress_image_high_quality(image_bytes)
         compressed_n = len(jpeg_bytes)
         logging.info(
             f"Original bytes: {len(image_bytes)}; JPEG bytes: {compressed_n}; est tokens if inlined: {estimate_tokens_from_bytes(compressed_n)}")
 
-        # prepare S3 key
         key = f"telegram_uploads/{uuid4().hex}.jpg"
 
-        # upload to S3 and get presigned URL
         presigned_url = await upload_bytes_to_s3_and_get_presigned_url(jpeg_bytes, key, expires=S3_PRESIGNED_EXPIRATION)
         if not presigned_url:
             await try_delete_message(status_msg)
@@ -587,11 +709,9 @@ async def process_image_directly(message: types.Message, image_bytes: bytes, cap
 
         logging.info(f"Uploaded to S3 key={key} presigned_url={presigned_url}")
 
-        # schedule auto-delete if configured
         if S3_AUTO_DELETE_AFTER > 0:
             await schedule_s3_delete(key, delay=S3_AUTO_DELETE_AFTER)
 
-        # Build payload with image_url only
         content = []
         content.append({"type": "text", "text": caption or "Опиши это изображение"})
         content.append({"type": "image_url", "image_url": {"url": presigned_url}})
@@ -625,7 +745,6 @@ async def process_image_directly(message: types.Message, image_bytes: bytes, cap
         ai_response = data['choices'][0]['message']['content']
         formatted = convert_markdown_to_html(ai_response)
         await try_delete_message(status_msg)
-        # split if long
         model_name = escape_html(get_model_name(model_id))
         response_text = f"🧠 <b>{model_name}</b>:\n\n{formatted}"
         if len(response_text) > 4096:
@@ -749,12 +868,10 @@ async def handle_message(message: types.Message):
         logging.info(f"OpenRouter response: {data}")
         await status.delete()
 
-        # Проверяем наличие ошибок
         if 'error' in data:
             error_msg = data['error']
             return await message.answer(f"⚠️ Ошибка OpenRouter: {error_msg}")
 
-        # Проверяем, есть ли choices в ответе
         if 'choices' not in data or not data['choices']:
             error_info = str(data)[:500] if data else "Empty response"
             return await message.answer(f"⚠️ Неожиданный формат ответа от OpenRouter: {error_info}")
@@ -762,7 +879,6 @@ async def handle_message(message: types.Message):
         logging.info(f"OpenRouter usage: {data.get('usage')}")
         ai_response = data['choices'][0]['message']['content']
         formatted = convert_markdown_to_html(ai_response)
-        # split if long
         response = f"🧠 <b>{escape_html(get_model_name(model_id))}</b>:\n\n{formatted}"
         if len(response) > 4096:
             for i in range(0, len(response), 4096):
