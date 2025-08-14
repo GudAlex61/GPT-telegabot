@@ -21,6 +21,8 @@ from uuid import uuid4
 import boto3
 from botocore.client import Config
 from concurrent.futures import ThreadPoolExecutor
+from aiogram.types import BufferedInputFile
+from html import escape as html_escape
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -49,6 +51,8 @@ S3_AUTO_DELETE_AFTER = int(os.getenv("S3_AUTO_DELETE_AFTER", "0"))  # seconds, 0
 IMAGE_MAX_SIZE = int(os.getenv("IMAGE_MAX_SIZE", "1600"))  # px (largest side)
 IMAGE_QUALITY = int(os.getenv("IMAGE_QUALITY", "90"))  # JPEG quality (1-100)
 
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
 # Models that accept image_url (IDs)
 MODELS_WITH_IMAGE_URL = {
     "openai/gpt-4o-mini",
@@ -96,6 +100,7 @@ def convert_markdown_to_html(text: str) -> str:
 
     math_blocks = []
     math_inlines = []
+    code_blocks = []
 
     def save_math_block(match):
         placeholder = f"{{MATH_BLOCK_{len(math_blocks)}}}"
@@ -115,20 +120,50 @@ def convert_markdown_to_html(text: str) -> str:
 
     text = re.sub(r'\\\((.*?)\\\)', save_math_inline, text, flags=re.DOTALL)
 
+    def save_code_block(match):
+        placeholder = f"{{CODE_BLOCK_{len(code_blocks)}}}"
+        language = match.group(1) or ""
+        code_content = match.group(2)
+        code_blocks.append((language, code_content))
+        return placeholder
+
+    # Обрабатываем блоки кода с указанием языка: ```language\ncontent```
+    text = re.sub(r'```(\w+)\n(.*?)```', save_code_block, text, flags=re.DOTALL)
+    # Обрабатываем блоки кода без указания языка: ```\ncontent```
+    text = re.sub(r'```\n(.*?)```', save_code_block, text, flags=re.DOTALL)
+
     text = text.replace('&', '&amp;').replace('<', '<').replace('>', '>')
 
     for i, math_block in enumerate(math_blocks):
         text = text.replace(f'{{MATH_BLOCK_{i}}}', f'<pre><code>{math_block}</code></pre>')
 
-    for i, math_inlines in enumerate(math_inlines):
-        text = text.replace(f'{{MATH_INLINE_{i}}}', f'<code>{math_inlines}</code>')
+    for i, math_inline in enumerate(math_inlines):
+        text = text.replace(f'{{MATH_INLINE_{i}}}', f'<code>{math_inline}</code>')
 
+    # Восстанавливаем блоки кода
+    for i, (language, code_content) in enumerate(code_blocks):
+        if language:
+            # Если указан язык, добавляем его как класс
+            text = text.replace(f'{{CODE_BLOCK_{i}}}', f'<pre><code class="language-{language}">{code_content}</code></pre>')
+        else:
+            text = text.replace(f'{{CODE_BLOCK_{i}}}', f'<pre><code>{code_content}</code></pre>')
+
+    # Обработка заголовков
+    text = re.sub(r'^######\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    text = re.sub(r'^#####\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    text = re.sub(r'^####\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    text = re.sub(r'^###\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    text = re.sub(r'^##\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    text = re.sub(r'^#\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+
+    # Базовое форматирование
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(.*?)__', r'<b>\1</b>', text)
     text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
     text = re.sub(r'_(.*?)_', r'<i>\1</i>', text)
     text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
-    text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+    # Обычные блоки кода без языка (если остались)
+    text = re.sub(r'```(.*?)```', r'<pre><code>\1</code></pre>', text, flags=re.DOTALL)
 
     return text
 
@@ -460,7 +495,7 @@ async def set_main_menu():
         BotCommand(command="/help", description="Помощь"),
         BotCommand(command="/models", description="Выбрать модель"),
         BotCommand(command="/currentmodel", description="Текущая модель"),
-        BotCommand(command="/upload_test", description="Тест загрузки изображения (публичный URL)"),
+        BotCommand(command="/imagine", description="Создать изображение")
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -481,14 +516,74 @@ async def cmd_help(m: types.Message):
         "/help - Помощь\n"
         "/models - Выбрать модель\n"
         "/currentmodel - Текущая модель\n"
-        "/upload_test - Тест публичного URL\n\n"
+        "/imagine - Создание изображения по запросу\n\n"
         "<b>Доступные модели:</b>\n"
     )
     for model_name, model_data in AVAILABLE_MODELS.items():
-        camera_icon = " 📷" if model_data["image_support"] else ""
-        help_text += f"• {escape_html(model_name)}{camera_icon}\n"
+        help_text += f"• {escape_html(model_name)}\n"
     await m.answer(help_text)
 
+@dp.message(Command("imagine"))
+async def cmd_imagine(m: types.Message):
+    if not m.text or len(m.text.strip()) <= len("/imagine"):
+        return await m.answer(
+            "🎨 Введите промпт после команды.\n"
+            "Пример: <code>/imagine a cyberpunk cat, 4k detailed</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+    prompt = m.text[len("/imagine"):].strip()
+    if not prompt:
+        return await m.answer("⚠️ Промпт не может быть пустым.")
+
+    await bot.send_chat_action(m.chat.id, "upload_photo")
+    status = await m.answer("<i>🎨 Генерирую изображение через SDXL...</i>")
+
+    try:
+        headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+        payload = {
+            "inputs": prompt,
+            # SDXL поддерживает параметры
+            # "parameters": {
+            #     "negative_prompt": "blurry, bad quality, ugly",
+            #     "guidance_scale": 7.5,
+            #     "num_inference_steps": 30
+            # }
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(HF_API_URL, headers=headers, json=payload) as resp:
+                logging.info(f"SDXL Response Status: {resp.status}")
+                if resp.status == 200:
+                    image_data = await resp.read()
+                    await status.delete()
+                    await m.answer_photo(
+                        BufferedInputFile(image_data, filename="sdxl_image.jpg"),
+                        caption=f"🖼️ SDXL: {escape_html(prompt)}"
+                    )
+                elif resp.status == 503:
+                    try:
+                        data = await resp.json()
+                        est_time = data.get("estimated_time", 20)
+                        await status.edit_text(f"<i>⏳ SDXL загружается... (~{int(est_time)} секунд)</i>")
+                    except Exception:
+                        await status.edit_text("<i>⏳ SDXL загружается...</i>")
+                else:
+                    text_error = await resp.text()
+                    logging.error(f"SDXL Error {resp.status}: {text_error}")
+                    await status.delete()
+                    await m.answer(
+                        f"⚠️ Ошибка генерации ({resp.status}):\n"
+                        f"<pre>{html_escape(text_error[:600])}</pre>",
+                        parse_mode=ParseMode.HTML
+                    )
+    except Exception as e:
+        logging.exception("SDXL image generation error")
+        try:
+            await status.delete()
+        except:
+            pass
+        await m.answer(f"🚫 Ошибка: {str(e)}")
 
 @dp.message(Command("models"))
 async def list_models(m: types.Message):
