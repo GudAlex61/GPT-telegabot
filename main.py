@@ -24,6 +24,10 @@ from concurrent.futures import ThreadPoolExecutor
 from aiogram.types import BufferedInputFile
 from html import escape as html_escape
 
+from diffusers import StableDiffusionPipeline
+import torch
+from io import BytesIO
+
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -52,7 +56,7 @@ IMAGE_MAX_SIZE = int(os.getenv("IMAGE_MAX_SIZE", "1600"))  # px (largest side)
 IMAGE_QUALITY = int(os.getenv("IMAGE_QUALITY", "90"))  # JPEG quality (1-100)
 
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev"
 # Models that accept image_url (IDs)
 MODELS_WITH_IMAGE_URL = {
     "openai/gpt-4o-mini",
@@ -98,19 +102,46 @@ def convert_markdown_to_html(text: str) -> str:
 
     import re
 
-    math_blocks = []
-    math_inlines = []
+    math_blocks_double = []  # Для $$...$$
+    math_blocks_single = []  # Для $...$
+    math_inlines = []  # Для $$...$$
     code_blocks = []
 
-    def save_math_block(match):
-        placeholder = f"{{MATH_BLOCK_{len(math_blocks)}}}"
+    # --- Обработка блочных формул ---
+    def save_math_block_double(match):
+        placeholder = f"{{MATH_BLOCK_DOUBLE_{len(math_blocks_double)}}}"
         math_content = match.group(1)
         math_content = replace_math_symbols(math_content)
-        math_blocks.append(math_content)
+        math_blocks_double.append(math_content)
         return placeholder
 
-    text = re.sub(r'\\\[(.*?)\\\]', save_math_block, text, flags=re.DOTALL)
+    # Обрабатываем $$...$$ (блочные формулы)
+    text = re.sub(r'\$\$(.*?)\$\$', save_math_block_double, text, flags=re.DOTALL)
 
+    # Обрабатываем $$...$$ (альтернативный формат для блоков)
+    text = re.sub(r'\\\[(.*?)\\\]', save_math_block_double, text, flags=re.DOTALL)
+
+    # --- Обработка inline формул с одиночным $ ---
+    def save_math_block_single(match):
+        # Избегаем случаев, когда $ находится внутри слова (например, "It costs 5$ and 10$")
+        # Простая проверка: перед $ не должно быть буквы/цифры, после $ должна быть буква/цифра или (, [
+        # И перед закрывающим $ не должно быть пробела, и после него должен быть пробел, знак препинания или конец строки
+        # Более надежно - проверять контекст, но для простоты обработаем все $...$
+        # кроме тех, которые выглядят как конец предыдущей формулы (правда таких вряд ли будет)
+        # Лучше всего - обрабатывать их до обработки других форматов.
+        # Но т.к. $$ и $$ уже обработаны, конфликта быть не должно.
+        placeholder = f"{{MATH_BLOCK_SINGLE_{len(math_blocks_single)}}}"
+        math_content = match.group(1)
+        math_content = replace_math_symbols(math_content)
+        math_blocks_single.append(math_content)
+        return placeholder
+
+    # Обрабатываем $...$ (inline формулы) - важно делать это до обработки * и _
+    # Используем lookahead и lookbehind для более точного определения
+    # (?<!\\)(?<!\$)\$(?!\$) - находит $, перед которым не \ и не $, и после которого не $
+    text = re.sub(r'(?<!\\)(?<!\$)\$(?!\$)(.*?)(?<!\\)(?<!\$)\$(?!\$)', save_math_block_single, text, flags=re.DOTALL)
+
+    # --- Обработка inline формул с двойным \( \) ---
     def save_math_inline(match):
         placeholder = f"{{MATH_INLINE_{len(math_inlines)}}}"
         math_content = match.group(1)
@@ -118,8 +149,10 @@ def convert_markdown_to_html(text: str) -> str:
         math_inlines.append(math_content)
         return placeholder
 
+    # Обрабатываем $$...$$ (inline формулы)
     text = re.sub(r'\\\((.*?)\\\)', save_math_inline, text, flags=re.DOTALL)
 
+    # --- Обработка блоков кода ---
     def save_code_block(match):
         placeholder = f"{{CODE_BLOCK_{len(code_blocks)}}}"
         language = match.group(1) or ""
@@ -132,11 +165,19 @@ def convert_markdown_to_html(text: str) -> str:
     # Обрабатываем блоки кода без указания языка: ```\ncontent```
     text = re.sub(r'```\n(.*?)```', save_code_block, text, flags=re.DOTALL)
 
+    # Экранирование HTML
     text = text.replace('&', '&amp;').replace('<', '<').replace('>', '>')
 
-    for i, math_block in enumerate(math_blocks):
-        text = text.replace(f'{{MATH_BLOCK_{i}}}', f'<pre><code>{math_block}</code></pre>')
+    # --- Восстановление блоков ---
+    # Восстанавливаем блочные формулы ($$...$$ и $$...$$)
+    for i, math_block in enumerate(math_blocks_double):
+        text = text.replace(f'{{MATH_BLOCK_DOUBLE_{i}}}', f'<pre><code>{math_block}</code></pre>')
 
+    # Восстанавливаем inline формулы ($...$)
+    for i, math_block in enumerate(math_blocks_single):
+        text = text.replace(f'{{MATH_BLOCK_SINGLE_{i}}}', f'<code>{math_block}</code>')
+
+    # Восстанавливаем inline формулы ($$...$$)
     for i, math_inline in enumerate(math_inlines):
         text = text.replace(f'{{MATH_INLINE_{i}}}', f'<code>{math_inline}</code>')
 
@@ -144,11 +185,12 @@ def convert_markdown_to_html(text: str) -> str:
     for i, (language, code_content) in enumerate(code_blocks):
         if language:
             # Если указан язык, добавляем его как класс
-            text = text.replace(f'{{CODE_BLOCK_{i}}}', f'<pre><code class="language-{language}">{code_content}</code></pre>')
+            text = text.replace(f'{{CODE_BLOCK_{i}}}',
+                                f'<pre><code class="language-{language}">{code_content}</code></pre>')
         else:
             text = text.replace(f'{{CODE_BLOCK_{i}}}', f'<pre><code>{code_content}</code></pre>')
 
-    # Обработка заголовков
+    # --- Обработка заголовков ---
     text = re.sub(r'^######\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
     text = re.sub(r'^#####\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
     text = re.sub(r'^####\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
@@ -156,17 +198,19 @@ def convert_markdown_to_html(text: str) -> str:
     text = re.sub(r'^##\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
     text = re.sub(r'^#\s+(.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
 
-    # Базовое форматирование
+    # --- Базовое форматирование ---
+    # Жирный текст
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(.*?)__', r'<b>\1</b>', text)
-    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
-    text = re.sub(r'_(.*?)_', r'<i>\1</i>', text)
+    # Курсив - обрабатываем после формул, чтобы не захватить знаки * или _ внутри формул
+    text = re.sub(r'(?<!\\)\*(?!\*)(.*?)(?<!\\)\*(?!\*)', r'<i>\1</i>', text)  # *...*
+    text = re.sub(r'(?<!\\)_(?!_)(.*?)(?<!\\)_(?!_)', r'<i>\1</i>', text)  # _..._
+    # Код
     text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
     # Обычные блоки кода без языка (если остались)
     text = re.sub(r'```(.*?)```', r'<pre><code>\1</code></pre>', text, flags=re.DOTALL)
 
     return text
-
 
 def replace_math_symbols(text: str) -> str:
     import re
