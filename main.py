@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+import base64
 import logging
 import aiohttp
 import os
@@ -55,8 +55,8 @@ S3_AUTO_DELETE_AFTER = int(os.getenv("S3_AUTO_DELETE_AFTER", "0"))  # seconds, 0
 IMAGE_MAX_SIZE = int(os.getenv("IMAGE_MAX_SIZE", "1600"))  # px (largest side)
 IMAGE_QUALITY = int(os.getenv("IMAGE_QUALITY", "90"))  # JPEG quality (1-100)
 
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev"
+TOGETHER_AI_API_KEY = os.getenv("TOGETHER_AI_API_KEY")
+TOGETHER_AI_API_URL = "https://api.together.xyz/v1/images/generations"
 # Models that accept image_url (IDs)
 MODELS_WITH_IMAGE_URL = {
     "openai/gpt-4o-mini",
@@ -567,6 +567,11 @@ async def cmd_help(m: types.Message):
         help_text += f"• {escape_html(model_name)}\n"
     await m.answer(help_text)
 
+
+# Убедитесь, что импорты вверху файла включают:
+# import base64
+# import json (обычно входит в стандартную библиотеку, импорт может быть не нужен если уже используется)
+
 @dp.message(Command("imagine"))
 async def cmd_imagine(m: types.Message):
     if not m.text or len(m.text.strip()) <= len("/imagine"):
@@ -581,54 +586,132 @@ async def cmd_imagine(m: types.Message):
         return await m.answer("⚠️ Промпт не может быть пустым.")
 
     await bot.send_chat_action(m.chat.id, "upload_photo")
-    status = await m.answer("<i>🎨 Генерирую изображение через SDXL...</i>")
+    status = await m.answer("<i>🎨 Генерирую изображение через Together AI (FLUX.1-schnell-Free)...</i>")
 
     try:
-        headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+        headers = {
+            "Authorization": f"Bearer {TOGETHER_AI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        # Используем бесплатную модель
         payload = {
-            "inputs": prompt,
-            # SDXL поддерживает параметры
-            # "parameters": {
-            #     "negative_prompt": "blurry, bad quality, ugly",
-            #     "guidance_scale": 7.5,
-            #     "num_inference_steps": 30
-            # }
+            "model": "black-forest-labs/FLUX.1-schnell-Free",
+            "prompt": prompt,
+            # Можно добавить другие параметры, поддерживаемые моделью
+            "steps": 4, # FLUX.1-schnell работает быстро, часто 4 шагов достаточно
+            "width": 1024,
+            "height": 1024
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(HF_API_URL, headers=headers, json=payload) as resp:
-                logging.info(f"SDXL Response Status: {resp.status}")
+            async with session.post(TOGETHER_AI_API_URL, headers=headers, json=payload) as resp:
+                logging.info(f"Together AI Response Status: {resp.status}")
+
                 if resp.status == 200:
-                    image_data = await resp.read()
-                    await status.delete()
-                    await m.answer_photo(
-                        BufferedInputFile(image_data, filename="sdxl_image.jpg"),
-                        caption=f"🖼️ SDXL: {escape_html(prompt)}"
-                    )
-                elif resp.status == 503:
                     try:
                         data = await resp.json()
-                        est_time = data.get("estimated_time", 20)
-                        await status.edit_text(f"<i>⏳ SDXL загружается... (~{int(est_time)} секунд)</i>")
-                    except Exception:
-                        await status.edit_text("<i>⏳ SDXL загружается...</i>")
+                    except Exception as e:
+                        text_error = await resp.text()
+                        logging.error(f"Together AI returned non-json: status={resp.status} text={text_error[:500]}")
+                        await status.delete()
+                        return await m.answer(
+                            f"⚠️ Ошибка обработки ответа от Together AI ({resp.status}):\n"
+                            f"<pre>{html_escape(text_error[:600])}</pre>",
+                            parse_mode=ParseMode.HTML
+                        )
+
+                    logging.info(f"Together AI JSON Response: {data}")
+
+                    # Обработка ответа от Together AI
+                    # Ожидаемый формат (пример):
+                    # {
+                    #   "data": [
+                    #     {
+                    #       "b64_json": "base64_encoded_image_data", // Или "url": "http://..."
+                    #       "seed": 12345,
+                    #       "finish_reason": "SUCCESS"
+                    #     }
+                    #   ]
+                    # }
+
+                    if 'data' not in data or not data['data'] or not isinstance(data['data'], list):
+                        await status.delete()
+                        return await m.answer(
+                            f"⚠️ Неожиданный формат ответа от Together AI:\n"
+                            f"<pre>{html_escape(str(data)[:600])}</pre>",
+                            parse_mode=ParseMode.HTML
+                        )
+
+                    image_info = data['data'][0]  # Берем первое изображение
+
+                    image_data_bytes = None
+                    if 'b64_json' in image_info and image_info['b64_json']:
+                        # Изображение в формате Base64
+                        try:
+                            image_data_bytes = base64.b64decode(image_info['b64_json'])
+                        except Exception as e:
+                            logging.error(f"Error decoding base64 image: {e}")
+                            await status.delete()
+                            return await m.answer("⚠️ Ошибка декодирования изображения от Together AI.")
+
+                    elif 'url' in image_info and image_info['url']:
+                        # Изображение по URL
+                        try:
+                            async with session.get(image_info['url']) as img_resp:
+                                if img_resp.status == 200:
+                                    image_data_bytes = await img_resp.read()
+                                else:
+                                    await status.delete()
+                                    return await m.answer(
+                                        f"⚠️ Не удалось скачать изображение по URL: {img_resp.status}")
+                        except Exception as e:
+                            logging.error(f"Error downloading image from URL: {e}")
+                            await status.delete()
+                            return await m.answer("⚠️ Ошибка скачивания изображения от Together AI.")
+                    else:
+                        await status.delete()
+                        return await m.answer(
+                            f"⚠️ Ответ от Together AI не содержит данных изображения (ни b64_json, ни url):\n"
+                            f"<pre>{html_escape(str(image_info)[:600])}</pre>",
+                            parse_mode=ParseMode.HTML
+                        )
+
+                    if image_data_bytes:
+                        await status.delete()
+                        await m.answer_photo(
+                            BufferedInputFile(image_data_bytes, filename="together_ai_image.jpg"),
+                            caption=f"🖼️ Together AI (FLUX.1-schnell-Free): {escape_html(prompt)}"
+                            # escape_html у вас уже есть
+                        )
+                    else:
+                        await status.delete()
+                        await m.answer("⚠️ Не удалось получить изображение от Together AI (пустые данные).")
+
+                # Обработка ошибок от API
                 else:
                     text_error = await resp.text()
-                    logging.error(f"SDXL Error {resp.status}: {text_error}")
+                    logging.error(f"Together AI Error {resp.status}: {text_error}")
                     await status.delete()
+                    # Попробуем распарсить JSON ошибки, если это возможно
+                    try:
+                        error_data = await resp.json()
+                        error_msg = error_data.get('message', text_error[:600])
+                    except:
+                        error_msg = text_error[:600]
+
                     await m.answer(
-                        f"⚠️ Ошибка генерации ({resp.status}):\n"
-                        f"<pre>{html_escape(text_error[:600])}</pre>",
+                        f"⚠️ Ошибка генерации Together AI ({resp.status}):\n"
+                        f"<pre>{html_escape(str(error_msg))}</pre>",
                         parse_mode=ParseMode.HTML
                     )
+
     except Exception as e:
-        logging.exception("SDXL image generation error")
+        logging.exception("Together AI image generation error")
         try:
             await status.delete()
         except:
             pass
         await m.answer(f"🚫 Ошибка: {str(e)}")
-
 @dp.message(Command("models"))
 async def list_models(m: types.Message):
     await show_models_keyboard(m, m.from_user.id)
