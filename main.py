@@ -26,6 +26,7 @@ from html import escape as html_escape
 import sqlite3
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from googletrans import Translator
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -101,6 +102,7 @@ DEFAULT_MODEL = "deepseek/deepseek-chat-v3-0324:free"
 OCR_MODEL = "google/gemini-flash-1.5"
 user_models: Dict[int, str] = {}
 last_bot_responses: Dict[int, str] = {}
+last_user_message: Dict[int, str] = {}
 
 # ---------- Database ----------
 DB_NAME = "bot_users.db"
@@ -599,268 +601,285 @@ async def set_main_menu():
 
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
-    user_id = m.from_user.id
-    referrer_id = None
+    try:
+        user_id = m.from_user.id
+        referrer_id = None
 
-    # Проверяем, есть ли параметр в команде /start
-    if m.text and len(m.text.split()) > 1:
-        ref_code_or_id = m.text.split()[1]
-        # Пытаемся получить referrer_id (простой способ - если это ID)
-        try:
-            potential_referrer_id = int(ref_code_or_id)
-            # Проверяем, существует ли такой пользователь и он не является самим собой
-            if potential_referrer_id != user_id and potential_referrer_id > 0:
-                referrer_id = potential_referrer_id
-        except ValueError:
-            pass  # В данном примере не обрабатываем коды
+        # Проверяем, есть ли параметр в команде /start
+        if m.text and len(m.text.split()) > 1:
+            ref_code_or_id = m.text.split()[1]
+            # Пытаемся получить referrer_id (простой способ - если это ID)
+            try:
+                potential_referrer_id = int(ref_code_or_id)
+                # Проверяем, существует ли такой пользователь и он не является самим собой
+                if potential_referrer_id != user_id and potential_referrer_id > 0:
+                    referrer_id = potential_referrer_id
+            except ValueError:
+                pass  # В данном примере не обрабатываем коды
 
-    # Проверяем, существует ли пользователь в БД
-    existing_user = db_get_user(user_id)
-    is_new_user = existing_user is None
+        # Проверяем, существует ли пользователь в БД
+        existing_user = db_get_user(user_id)
+        is_new_user = existing_user is None
 
-    welcome_text = "<b>🤖 AI Chat Bot</b>\nОтправьте текст или изображение."
+        welcome_text = "<b>🤖 AI Chat Bot</b>\nОтправьте текст или изображение."
 
-    if is_new_user:
-        # Пробуем создать пользователя
-        if db_create_user(user_id, referrer_id):
-            if referrer_id:
-                # Пользователь пришёл по ссылке
-                # Отправляем сообщение пригласившему (если он есть в user_models, значит, ботался)
-                try:
-                    # Проверим, существует ли пригласивший в БД (на всякий случай)
-                    if db_get_user(referrer_id):
-                        await bot.send_message(referrer_id,
-                                               f"🎉 Поздравляем! По вашей ссылке присоединился новый пользователь (ID: {user_id}). Вы получили {REFERRAL_TOKENS} токенов!")
-                    # Можно добавить логику, чтобы не спамить, если пользователь давно не активен
-                except Exception as e:
-                    logging.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
+        if is_new_user:
+            # Пробуем создать пользователя
+            if db_create_user(user_id, referrer_id):
+                if referrer_id:
+                    # Пользователь пришёл по ссылке
+                    # Отправляем сообщение пригласившему (если он есть в user_models, значит, ботался)
+                    try:
+                        # Проверим, существует ли пригласивший в БД (на всякий случай)
+                        if db_get_user(referrer_id):
+                            await bot.send_message(referrer_id,
+                                                   f"🎉 Поздравляем! По вашей ссылке присоединился новый пользователь (ID: {user_id}). Вы получили {REFERRAL_TOKENS} токенов!")
+                        # Можно добавить логику, чтобы не спамить, если пользователь давно не активен
+                    except Exception as e:
+                        logging.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
 
-                welcome_text += f"\n\n👋 Добро пожаловать! Вы получили {STARTING_TOKENS} токенов за переход по реферальной ссылке!"
-            # Инициализируем модель пользователя (если нужно)
-            if user_id not in user_models:
-                user_models[user_id] = DEFAULT_MODEL
-        else:
-            # Ошибка создания пользователя
-            welcome_text = "<b>🤖 AI Chat Bot</b>\n❌ Ошибка регистрации. Попробуйте позже."
-    # else: Пользователь уже существует, просто приветствие
+                    welcome_text += f"\n\n👋 Добро пожаловать! Вы получили {STARTING_TOKENS} токенов за переход по реферальной ссылке!"
+                # Инициализируем модель пользователя (если нужно)
+                if user_id not in user_models:
+                    user_models[user_id] = DEFAULT_MODEL
+            else:
+                # Ошибка создания пользователя
+                welcome_text = "<b>🤖 AI Chat Bot</b>\n❌ Ошибка регистрации. Попробуйте позже."
+        # else: Пользователь уже существует, просто приветствие
 
-    await m.answer(welcome_text)
+        await m.answer(welcome_text)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /start")
+        await m.answer("❌ Не удалось обработать команду. Пожалуйста, попробуйте позже.")
 
 
 @dp.message(Command("help"))
 async def cmd_help(m: types.Message):
-    help_text = (
-        "<b>🛠️ Команды:</b>\n"
-        "/start - Запустить бота\n"
-        "/help - Помощь\n"
-        "/models - Выбрать модель\n"
-        "/currentmodel - Текущая модель\n"
-        "/imagine - Создание изображения по запросу\n"
-        "/profile - Мой профиль\n"
-        "<b>Доступные модели:</b>\n"
-    )
-    for model_name, model_data in AVAILABLE_MODELS.items():
-        help_text += f"• {escape_html(model_name)}\n"
-    await m.answer(help_text)
+    try:
+        help_text = (
+            "<b>🛠️ Команды:</b>\n"
+            "/start - Запустить бота\n"
+            "/help - Помощь\n"
+            "/models - Выбрать модель\n"
+            "/currentmodel - Текущая модель\n"
+            "/imagine - Создание изображения по запросу\n"
+            "/profile - Мой профиль\n"
+            "<b>Доступные модели:</b>\n"
+        )
+        for model_name, model_data in AVAILABLE_MODELS.items():
+            help_text += f"• {escape_html(model_name)}\n"
+        await m.answer(help_text)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /help")
+        await m.answer("❌ Не удалось показать справку. Пожалуйста, попробуйте позже.")
 
 
 @dp.message(Command("imagine"))
 async def cmd_imagine(m: types.Message, state: FSMContext):
-    await state.set_state(ImageGenState.waiting_for_prompt)
-    await m.answer(
-        "🎨 Отправьте текстовый запрос для генерации изображения. Чтобы выйти из режима генерации, используйте /cancel.")
+    try:
+        await state.set_state(ImageGenState.waiting_for_prompt)
+        await m.answer(
+            "🎨 Отправьте текстовый запрос для генерации изображения. Чтобы выйти из режима генерации, используйте /cancel.")
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /imagine")
+        await m.answer("❌ Не удалось активировать режим генерации изображений. Пожалуйста, попробуйте позже.")
+
 
 @dp.message(StateFilter(ImageGenState.waiting_for_prompt), F.text.startswith('/'))
 async def handle_any_command_during_imagine(m: types.Message, state: FSMContext):
-    await state.clear()
+    try:
+        await state.clear()
 
-    if m.text.startswith("/cancel"):
+        if m.text.startswith("/cancel"):
+            await m.answer("❌ Режим генерации изображений отменен.")
+            return
+
         await m.answer("❌ Режим генерации изображений отменен.")
-        return
 
-    await m.answer("❌ Режим генерации изображений отменен.")
+        if m.text.startswith("/start"):
+            await cmd_start(m)
+        elif m.text.startswith("/help"):
+            await cmd_help(m)
+        elif m.text.startswith("/models"):
+            await list_models(m)
+        elif m.text.startswith("/currentmodel"):
+            await current_model(m)
+        elif m.text.startswith("/profile"):
+            await cmd_profile(m)
+        elif m.text.startswith("/imagine"):
+            await cmd_imagine(m, state)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике команды во время ожидания промпта")
+        await m.answer("❌ Не удалось обработать команду. Пожалуйста, попробуйте позже.")
 
-    if m.text.startswith("/start"):
-        await cmd_start(m)
-    elif m.text.startswith("/help"):
-        await cmd_help(m)
-    elif m.text.startswith("/models"):
-        await list_models(m)
-    elif m.text.startswith("/currentmodel"):
-        await current_model(m)
-    elif m.text.startswith("/profile"):
-        await cmd_profile(m)
-    elif m.text.startswith("/imagine"):
-        await cmd_imagine(m, state)
 
 @dp.message(StateFilter(ImageGenState.waiting_for_prompt))
 async def handle_image_prompt(m: types.Message, state: FSMContext):
-    user_id = m.from_user.id
-    prompt = m.text.strip()
-
-    if not prompt:
-        return await m.answer("⚠️ Промпт не может быть пустым.")
-
-    if not db_use_tokens(user_id, TOKEN_COST_IMAGE_GEN):
-        stats = db_get_user_stats(user_id)
-        await state.clear()  # Выходим из состояния при ошибке
-        return await m.answer(
-            f"⚠️ Недостаточно токенов для генерации изображения. У вас {stats['tokens']} токенов, требуется {TOKEN_COST_IMAGE_GEN}.")
-
-    await bot.send_chat_action(m.chat.id, "upload_photo")
-    status = await m.answer("<i>🎨 Генерирую изображение через Together AI (FLUX.1-schnell-Free)...</i>")
-
     try:
-        headers = {
-            "Authorization": f"Bearer {TOGETHER_AI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "black-forest-labs/FLUX.1-schnell-Free",
-            "prompt": prompt,
-            "steps": 4,
-            "width": 1024,
-            "height": 1024
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(TOGETHER_AI_API_URL, headers=headers, json=payload) as resp:
-                logging.info(f"Together AI Response Status: {resp.status}")
-                if resp.status == 200:
-                    try:
-                        data = await resp.json()
-                    except Exception as e:
-                        text_error = await resp.text()
-                        logging.error(f"Together AI returned non-json: status={resp.status} text={text_error[:500]}")
-                        await status.delete()
-                        await state.clear()
-                        return await m.answer(
-                            f"⚠️ Ошибка обработки ответа от Together AI ({resp.status}):\n"
-                            f"<pre>{html_escape(text_error[:600])}</pre>",
-                            parse_mode=ParseMode.HTML
-                        )
-                    logging.info(f"Together AI JSON Response: {data}")
-                    if 'data' not in data or not data['data'] or not isinstance(data['data'], list):
-                        await status.delete()
-                        await state.clear()
-                        return await m.answer(
-                            f"⚠️ Неожиданный формат ответа от Together AI:\n"
-                            f"<pre>{html_escape(str(data)[:600])}</pre>",
-                            parse_mode=ParseMode.HTML
-                        )
-                    image_info = data['data'][0]
-                    image_data_bytes = None
-                    if 'b64_json' in image_info and image_info['b64_json']:
+        translator = Translator()
+        user_id = m.from_user.id
+        translation = await translator.translate(m.text.strip())
+        prompt = translation.text
+        print(prompt)
+        if not prompt:
+            return await m.answer("⚠️ Промпт не может быть пустым.")
+
+        if not db_use_tokens(user_id, TOKEN_COST_IMAGE_GEN):
+            stats = db_get_user_stats(user_id)
+            await state.clear()  # Выходим из состояния при ошибке
+            return await m.answer(
+                f"⚠️ Недостаточно токенов для генерации изображения. У вас {stats['tokens']} токенов, требуется {TOKEN_COST_IMAGE_GEN}.")
+
+        await bot.send_chat_action(m.chat.id, "upload_photo")
+        status = await m.answer("<i>🎨 Генерирую изображение через Together AI (FLUX.1-schnell-Free)...</i>")
+
+        try:
+            headers = {
+                "Authorization": f"Bearer {TOGETHER_AI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "black-forest-labs/FLUX.1-schnell-Free",
+                "prompt": prompt,
+                "steps": 4,
+                "width": 1024,
+                "height": 1024
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(TOGETHER_AI_API_URL, headers=headers, json=payload) as resp:
+                    logging.info(f"Together AI Response Status: {resp.status}")
+                    if resp.status == 200:
                         try:
-                            image_data_bytes = base64.b64decode(image_info['b64_json'])
+                            data = await resp.json()
                         except Exception as e:
-                            logging.error(f"Error decoding base64 image: {e}")
+                            text_error = await resp.text()
+                            logging.error(f"Together AI returned non-json: status={resp.status} text={text_error[:500]}")
                             await status.delete()
                             await state.clear()
-                            return await m.answer("⚠️ Ошибка декодирования изображения от Together AI.")
-                    elif 'url' in image_info and image_info['url']:
-                        try:
-                            async with session.get(image_info['url']) as img_resp:
-                                if img_resp.status == 200:
-                                    image_data_bytes = await img_resp.read()
-                                else:
-                                    await status.delete()
-                                    await state.clear()  # Выходим из состояния при ошибке
-                                    return await m.answer(
-                                        f"⚠️ Не удалось скачать изображение по URL: {img_resp.status}")
-                        except Exception as e:
-                            logging.error(f"Error downloading image from URL: {e}")
+                            return await m.answer("❌ Не удалось обработать ответ от сервера генерации.")
+                        logging.info(f"Together AI JSON Response: {data}")
+                        if 'data' not in data or not data['data'] or not isinstance(data['data'], list):
+                            await status.delete()
+                            await state.clear()
+                            return await m.answer("❌ Неожиданный формат ответа от сервера генерации.")
+                        image_info = data['data'][0]
+                        image_data_bytes = None
+                        if 'b64_json' in image_info and image_info['b64_json']:
+                            try:
+                                image_data_bytes = base64.b64decode(image_info['b64_json'])
+                            except Exception as e:
+                                logging.error(f"Error decoding base64 image: {e}")
+                                await status.delete()
+                                await state.clear()
+                                return await m.answer("❌ Ошибка декодирования изображения.")
+                        elif 'url' in image_info and image_info['url']:
+                            try:
+                                async with session.get(image_info['url']) as img_resp:
+                                    if img_resp.status == 200:
+                                        image_data_bytes = await img_resp.read()
+                                    else:
+                                        await status.delete()
+                                        await state.clear()  # Выходим из состояния при ошибке
+                                        return await m.answer("❌ Не удалось скачать изображение.")
+                            except Exception as e:
+                                logging.error(f"Error downloading image from URL: {e}")
+                                await status.delete()
+                                await state.clear()  # Выходим из состояния при ошибке
+                                return await m.answer("❌ Ошибка скачивания изображения.")
+                        else:
                             await status.delete()
                             await state.clear()  # Выходим из состояния при ошибке
-                            return await m.answer("⚠️ Ошибка скачивания изображения от Together AI.")
+                            return await m.answer("❌ Ответ не содержит данных изображения.")
+                        if image_data_bytes:
+                            await status.delete()
+                            await m.answer_photo(
+                                BufferedInputFile(image_data_bytes, filename="together_ai_image.jpg"),
+                                caption=f"🖼️FLUX.1\n <b>Промпт:</b> {escape_html(m.text.strip())}"
+                            )
+                            # Оставляем состояние активным для продолжения генерации
+                        else:
+                            await status.delete()
+                            await state.clear()  # Выходим из состояния при ошибке
+                            await m.answer("❌ Не удалось получить изображение.")
                     else:
+                        text_error = await resp.text()
+                        logging.error(f"Together AI Error {resp.status}: {text_error}")
                         await status.delete()
                         await state.clear()  # Выходим из состояния при ошибке
-                        return await m.answer(
-                            f"⚠️ Ответ от Together AI не содержит данных изображения (ни b64_json, ни url):\n"
-                            f"<pre>{html_escape(str(image_info)[:600])}</pre>",
-                            parse_mode=ParseMode.HTML
-                        )
-                    if image_data_bytes:
-                        await status.delete()
-                        await m.answer_photo(
-                            BufferedInputFile(image_data_bytes, filename="together_ai_image.jpg"),
-                            caption=f"🖼️ Together AI (FLUX.1-schnell-Free): {escape_html(prompt)}"
-                        )
-                        # Оставляем состояние активным для продолжения генерации
-                    else:
-                        await status.delete()
-                        await state.clear()  # Выходим из состояния при ошибке
-                        await m.answer("⚠️ Не удалось получить изображение от Together AI (пустые данные).")
-                else:
-                    text_error = await resp.text()
-                    logging.error(f"Together AI Error {resp.status}: {text_error}")
-                    await status.delete()
-                    await state.clear()  # Выходим из состояния при ошибке
-                    try:
-                        error_data = await resp.json()
-                        error_msg = error_data.get('message', text_error[:600])
-                    except:
-                        error_msg = text_error[:600]
-                    await m.answer(
-                        f"⚠️ Ошибка генерации Together AI ({resp.status}):\n"
-                        f"<pre>{html_escape(str(error_msg))}</pre>",
-                        parse_mode=ParseMode.HTML
-                    )
+                        await m.answer("❌ Ошибка генерации изображения. Пожалуйста попробуйте позже.")
+        except Exception as e:
+            logging.exception("Together AI image generation error")
+            try:
+                await status.delete()
+            except:
+                pass
+            await state.clear()  # Выходим из состояния при ошибке
+            await m.answer("❌ Ошибка генерации изображения. Попробуйте позже.")
     except Exception as e:
-        logging.exception("Together AI image generation error")
-        try:
-            await status.delete()
-        except:
-            pass
-        await state.clear()  # Выходим из состояния при ошибке
-        await m.answer(f"🚫 Ошибка: {str(e)}")
+        logging.exception("Ошибка в обработчике промпта для изображения")
+        await m.answer("❌ Не удалось обработать запрос на генерацию изображения. Пожалуйста, попробуйте позже.")
+        await state.clear()  # Важно: сбрасываем состояние
+
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(m: types.Message):
     pass
 
+
 @dp.message(Command("models"))
 async def list_models(m: types.Message):
-    await show_models_keyboard(m, m.from_user.id)
+    try:
+        await show_models_keyboard(m, m.from_user.id)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /models")
+        await m.answer("❌ Не удалось показать список моделей. Пожалуйста, попробуйте позже.")
 
 
 async def show_models_keyboard(message: types.Message, user_id: int, edit: bool = False):
-    builder = InlineKeyboardBuilder()
-    current_model_id = get_user_model(user_id)
-    new_text = f"🛠️ <b>Выберите модель:</b>\nТекущая: {escape_html(get_model_name(current_model_id))}\n<i>Нажмите на модель</i>"
-    for model_name, model_data in AVAILABLE_MODELS.items():
-        prefix = "✅ " if model_data["id"] == current_model_id else ""
-        camera_icon = " 📷" if model_data["image_support"] else ""
-        builder.button(text=f"{prefix}{model_name}{camera_icon}", callback_data=f"model_{model_data['id']}")
-    builder.button(text="❌ Закрыть", callback_data="close_menu")
-    builder.adjust(2, 2, 2)
-    new_markup = builder.as_markup()
-    if edit:
-        try:
-            current_text = message.html_text
-            current_markup = message.reply_markup
-            if new_text != current_text or str(new_markup) != str(current_markup):
-                await message.edit_text(new_text, reply_markup=new_markup)
-            else:
-                logging.debug("Message content not changed, skipping edit")
-        except Exception as e:
-            logging.error(f"Error editing message: {e}")
-    else:
-        await message.answer(new_text, reply_markup=new_markup)
+    try:
+        builder = InlineKeyboardBuilder()
+        current_model_id = get_user_model(user_id)
+        new_text = f"🛠️ <b>Выберите модель:</b>\nТекущая: {escape_html(get_model_name(current_model_id))}\n<i>Нажмите на модель</i>"
+        for model_name, model_data in AVAILABLE_MODELS.items():
+            prefix = "✅ " if model_data["id"] == current_model_id else ""
+            builder.button(text=f"{prefix}{model_name}", callback_data=f"model_{model_data['id']}")
+        builder.button(text="❌ Закрыть", callback_data="close_menu")
+        builder.adjust(2, 2, 2)
+        new_markup = builder.as_markup()
+        if edit:
+            try:
+                current_text = message.html_text
+                current_markup = message.reply_markup
+                if new_text != current_text or str(new_markup) != str(current_markup):
+                    await message.edit_text(new_text, reply_markup=new_markup)
+                else:
+                    logging.debug("Message content not changed, skipping edit")
+            except Exception as e:
+                logging.error(f"Error editing message: {e}")
+        else:
+            await message.answer(new_text, reply_markup=new_markup)
+    except Exception as e:
+        logging.exception("Ошибка в show_models_keyboard")
+        if not edit:
+            await message.answer("❌ Не удалось показать модели. Пожалуйста, попробуйте позже.")
 
 
 @dp.callback_query(F.data.startswith("model_"))
 async def set_model_callback(callback: types.CallbackQuery):
-    model_id = callback.data.split("_", 1)[1]
-    user_id = callback.from_user.id
-    model_exists = any(model_data["id"] == model_id for model_data in AVAILABLE_MODELS.values())
-    if model_exists:
-        user_models[user_id] = model_id
-        await show_models_keyboard(callback.message, user_id, edit=True)
-        model_name = escape_html(get_model_name(model_id))
-        await callback.answer(f"Модель изменена на {model_name}")
-    else:
-        await callback.answer("⚠️ Неизвестная модель", show_alert=True)
+    try:
+        model_id = callback.data.split("_", 1)[1]
+        user_id = callback.from_user.id
+        model_exists = any(model_data["id"] == model_id for model_data in AVAILABLE_MODELS.values())
+        if model_exists:
+            user_models[user_id] = model_id
+            await show_models_keyboard(callback.message, user_id, edit=True)
+            model_name = escape_html(get_model_name(model_id))
+            await callback.answer(f"Модель изменена на {model_name}")
+        else:
+            await callback.answer("⚠️ Неизвестная модель", show_alert=True)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике выбора модели")
+        await callback.answer("❌ Не удалось изменить модель. Пожалуйста, попробуйте позже.", show_alert=True)
 
 
 @dp.callback_query(F.data == "close_menu")
@@ -874,83 +893,94 @@ async def close_menu_callback(callback: types.CallbackQuery):
 
 @dp.message(Command("currentmodel"))
 async def current_model(m: types.Message):
-    user_id = m.from_user.id
-    model_id = get_user_model(user_id)
-    model_name = escape_html(get_model_name(model_id))
-    image_support = "Да" if get_model_support_images(model_id) else "Нет"
+    try:
+        user_id = m.from_user.id
+        model_id = get_user_model(user_id)
+        model_name = escape_html(get_model_name(model_id))
 
-    stats = db_get_user_stats(user_id)
-    tokens = stats.get("tokens", 0)
+        stats = db_get_user_stats(user_id)
+        tokens = stats.get("tokens", 0)
 
-    await m.answer(
-        f"🔧 <b>Текущая модель:</b> {model_name}\n📸 <b>Поддержка изображений:</b> {image_support}\n🎁 <b>Токены:</b> {tokens}")
+        await m.answer(
+            f"🔧 <b>Текущая модель:</b> {model_name}\n🎁 <b>Токены:</b> {tokens}")
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /currentmodel")
+        await m.answer("❌ Не удалось показать текущую модель. Пожалуйста, попробуйте позже.")
 
 
 @dp.message(Command("profile"))
 async def cmd_profile(m: types.Message):
-    user_id = m.from_user.id
-    # Убедимся, что пользователь существует в БД
-    existing_user = db_get_user(user_id)
-    if existing_user is None:
-        # Регистрируем пользователя без реферера
-        db_create_user(user_id)
+    try:
+        user_id = m.from_user.id
+        # Убедимся, что пользователь существует в БД
+        existing_user = db_get_user(user_id)
+        if existing_user is None:
+            # Регистрируем пользователя без реферера
+            db_create_user(user_id)
 
-    # Получаем статистику
-    stats = db_get_user_stats(user_id)
-    referred_count = stats.get("referral_count", 0)
-    tokens = stats.get("tokens", 0)
+        # Получаем статистику
+        stats = db_get_user_stats(user_id)
+        referred_count = stats.get("referral_count", 0)
+        tokens = stats.get("tokens", 0)
 
-    # Реферальная ссылка
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
-    if not bot_username:
-        await m.answer("⚠️ Бот должен иметь имя пользователя (@username) для создания реферальных ссылок.")
-        return
+        # Реферальная ссылка
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+        if not bot_username:
+            await m.answer("⚠️ Бот должен иметь имя пользователя (@username) для создания реферальных ссылок.")
+            return
 
-    referral_link = f"https://t.me/{bot_username}?start={user_id}"
+        referral_link = f"https://t.me/{bot_username}?start={user_id}"
 
-    response_text = (
-        f"<b>👤 Мой профиль</b>\n\n"
-        f"<b>🔗 Реферальная ссылка:</b>\n"
-        f"<code>{referral_link}</code>\n\n"
-        f"<b>📊 Статистика:</b>\n"
-        f"Приглашено друзей: {referred_count}\n"
-        f"Токены: {tokens}"
-    )
+        response_text = (
+            f"<b>👤 Мой профиль</b>\n\n"
+            f"<b>🔗 Реферальная ссылка:</b>\n"
+            f"<code>{referral_link}</code>\n\n"
+            f"<b>📊 Статистика:</b>\n"
+            f"Приглашено друзей: {referred_count}\n"
+            f"Токены: {tokens}"
+        )
 
-    await m.answer(response_text, parse_mode=ParseMode.HTML)
+        await m.answer(response_text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /profile")
+        await m.answer("❌ Не удалось показать профиль. Пожалуйста, попробуйте позже.")
 
 
 @dp.message(Command("upload_test"))
 async def cmd_upload_test(m: types.Message):
-    user_id = m.from_user.id
-    # Проверка токенов
-    if not db_use_tokens(user_id, TOKEN_COST_OCR):
-        stats = db_get_user_stats(user_id)
-        return await m.answer(
-            f"⚠️ Недостаточно токенов для OCR. У вас {stats['tokens']} токенов, требуется {TOKEN_COST_OCR}.")
+    try:
+        user_id = m.from_user.id
+        # Проверка токенов
+        if not db_use_tokens(user_id, TOKEN_COST_OCR):
+            stats = db_get_user_stats(user_id)
+            return await m.answer(
+                f"⚠️ Недостаточно токенов для OCR. У вас {stats['tokens']} токенов, требуется {TOKEN_COST_OCR}.")
 
-    test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/1024px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
-    model_id = get_user_model(user_id)
-    if not get_model_support_images(model_id):
-        return await m.answer(
-            "Текущая модель не поддерживает изображения. Выберите модель с поддержкой изображений (/models).")
-    status = await m.answer("<i>Тестовый запрос: отправляю публичный URL...</i>")
-    content = [{"type": "text", "text": "Опиши это изображение (тестовый публичный URL)"},
-               {"type": "image_url", "image_url": {"url": test_url}}]
-    payload = {"model": model_id, "messages": [{"role": "user", "content": content}]}
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers,
-                                json=payload) as resp:
-            text = await resp.text()
-            try:
-                data = await resp.json()
-            except Exception:
-                await status.delete()
-                return await m.answer(f"Ошибка OpenRouter: status={resp.status} text={text[:400]}")
-    await status.delete()
-    await m.answer(f"OpenRouter response status {resp.status}. Usage: {data.get('usage')}\nPreview: {str(data)[:1000]}")
+        test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/1024px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+        model_id = get_user_model(user_id)
+        if not get_model_support_images(model_id):
+            return await m.answer(
+                "Текущая модель не поддерживает изображения. Выберите модель с поддержкой изображений (/models).")
+        status = await m.answer("<i>Тестовый запрос: отправляю публичный URL...</i>")
+        content = [{"type": "text", "text": "Опиши это изображение (тестовый публичный URL)"},
+                   {"type": "image_url", "image_url": {"url": test_url}}]
+        payload = {"model": model_id, "messages": [{"role": "user", "content": content}]}
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers,
+                                    json=payload) as resp:
+                text = await resp.text()
+                try:
+                    data = await resp.json()
+                except Exception:
+                    await status.delete()
+                    return await m.answer("❌ Ошибка обработки ответа от сервера.")
+        await status.delete()
+        await m.answer(f"OpenRouter response status {resp.status}. Usage: {data.get('usage')}\nPreview: {str(data)[:1000]}")
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /upload_test")
+        await m.answer("❌ Не удалось выполнить тест загрузки. Пожалуйста, попробуйте позже.")
 
 
 # ---------- Image processing ----------
@@ -971,7 +1001,7 @@ async def process_image_message(message: types.Message, image_bytes: bytes, capt
             await try_delete_message(status_msg)
         except Exception:
             pass
-        await message.answer("🚫 Ошибка при обработке изображения")
+        await message.answer("❌ Не удалось обработать изображение. Попробуйте позже.")
 
 
 async def process_image_with_ocr(message: types.Message, image_bytes: bytes, caption: str, model_id: str, status_msg,
@@ -1012,7 +1042,7 @@ async def process_image_with_ocr(message: types.Message, image_bytes: bytes, cap
                         await try_delete_message(status_msg)
                     except Exception:
                         pass
-                    return await message.answer(f"⚠️ Ошибка OpenRouter ({resp.status}): {text[:400]}")
+                    return await message.answer("❌ Ошибка обработки ответа от сервера.")
         logging.info(f"OpenRouter response: {data}")
         if 'error' in data:
             error_msg = data['error']
@@ -1020,15 +1050,17 @@ async def process_image_with_ocr(message: types.Message, image_bytes: bytes, cap
                 await try_delete_message(status_msg)
             except Exception:
                 pass
-            return await message.answer(f"⚠️ Ошибка OpenRouter: {error_msg}")
+            return await message.answer("❌ Ошибка обработки изображения.")
         if 'choices' not in data or not data['choices']:
             try:
                 await try_delete_message(status_msg)
             except Exception:
                 pass
-            return await message.answer(f"⚠️ Неожиданный формат ответа от OpenRouter: {str(data)[:500]}")
+            return await message.answer("❌ Неожиданный формат ответа от сервера.")
         ai_response = data['choices'][0]['message']['content']
         formatted = convert_markdown_to_html(ai_response)
+        last_user_message[user_id]=caption
+        last_bot_responses[user_id]=ai_response
         try:
             await try_delete_message(status_msg)
         except Exception:
@@ -1046,7 +1078,7 @@ async def process_image_with_ocr(message: types.Message, image_bytes: bytes, cap
             await try_delete_message(status_msg)
         except Exception:
             pass
-        await message.answer(f"🚫 Ошибка при обработке изображения через OCR: {str(e)}")
+        await message.answer("❌ Ошибка при обработке изображения через OCR. Попробуйте позже.")
 
 
 async def process_image_directly(message: types.Message, image_bytes: bytes, caption: str, model_id: str, status_msg,
@@ -1068,8 +1100,7 @@ async def process_image_directly(message: types.Message, image_bytes: bytes, cap
         if not presigned_url:
             await try_delete_message(status_msg)
             logging.error("Failed to upload to S3 / generate presigned URL")
-            return await message.answer(
-                "Не удалось загрузить изображение в облако (S3). Повторите позже или проверьте настройки.")
+            return await message.answer("❌ Не удалось загрузить изображение в облако. Повторите позже.")
         logging.info(f"Uploaded to S3 key={key} presigned_url={presigned_url}")
         if S3_AUTO_DELETE_AFTER > 0:
             await schedule_s3_delete(key, delay=S3_AUTO_DELETE_AFTER)
@@ -1088,15 +1119,15 @@ async def process_image_directly(message: types.Message, image_bytes: bytes, cap
                 except Exception:
                     logging.error(f"OpenRouter returned non-json: status={resp.status} text={text[:400]}")
                     await try_delete_message(status_msg)
-                    return await message.answer(f"⚠️ Ошибка OpenRouter ({resp.status}): {text[:400]}")
+                    return await message.answer("❌ Ошибка обработки ответа от сервера.")
         logging.info(f"OpenRouter response: {data}")
         await try_delete_message(status_msg)
         if 'error' in data:
             error_msg = data['error']
-            return await message.answer(f"⚠️ Ошибка OpenRouter: {error_msg}")
+            return await message.answer("❌ Ошибка обработки изображения.")
         if 'choices' not in data or not data['choices']:
             error_info = str(data)[:500] if data else "Empty response"
-            return await message.answer(f"⚠️ Неожиданный формат ответа от OpenRouter: {error_info}")
+            return await message.answer("❌ Неожиданный формат ответа от сервера.")
         ai_response = data['choices'][0]['message']['content']
         formatted = convert_markdown_to_html(ai_response)
         await try_delete_message(status_msg)
@@ -1113,7 +1144,7 @@ async def process_image_directly(message: types.Message, image_bytes: bytes, cap
             await try_delete_message(status_msg)
         except Exception:
             pass
-        await message.answer(f"🚫 Ошибка при обработке изображения: {str(e)}")
+        await message.answer("❌ Ошибка при обработке изображения. Попробуйте позже.")
 
 
 @dp.message(F.content_type == ContentType.PHOTO)
@@ -1129,7 +1160,7 @@ async def handle_photo(message: types.Message):
             image_bytes = downloaded.read()
         except Exception:
             logging.exception("Failed to download photo")
-            return await message.answer("⚠️ Не удалось скачать изображение.")
+            return await message.answer("❌ Не удалось скачать изображение.")
     await process_image_message(message, image_bytes, message.caption or "")
 
 
@@ -1150,6 +1181,8 @@ async def handle_message(message: types.Message):
 
     # --- Получаем последний ответ бота ---
     last_response = last_bot_responses.get(user_id)
+    last_message = last_user_message.get(user_id)
+    print(last_message, last_response)
     # --- Формируем список сообщений для OpenRouter ---
     messages = [
         {"role": "user", "content": user_text}
@@ -1160,7 +1193,10 @@ async def handle_message(message: types.Message):
             "role": "assistant",
             "content": last_response
         })
-
+    if last_message:
+        messages.insert(0, {
+            "role": "user", "content": last_message
+        })
     status = await message.answer("<i>🤖 Обрабатываю...</i>")
     await bot.send_chat_action(message.chat.id, "typing")
     try:
@@ -1185,20 +1221,21 @@ async def handle_message(message: types.Message):
                 except Exception:
                     logging.error(f"OpenRouter returned non-json: status={resp.status} text={text[:400]}")
                     await try_delete_message(status)
-                    return await message.answer(f"⚠️ Ошибка OpenRouter ({resp.status}): {text[:400]}")
+                    return await message.answer("❌ Ошибка обработки ответа от сервера.")
         logging.info(f"OpenRouter response: {data}")
         await try_delete_message(status)
         if 'error' in data:
             error_msg = data['error']
-            return await message.answer(f"⚠️ Ошибка OpenRouter: {error_msg}")
+            return await message.answer("❌ Ошибка обработки запроса.")
         if 'choices' not in data or not data['choices']:
             error_info = str(data)[:500] if data else "Empty response"
-            return await message.answer(f"⚠️ Неожиданный формат ответа от OpenRouter: {error_info}")
+            return await message.answer("❌ Неожиданный формат ответа от сервера.")
         logging.info(f"OpenRouter usage: {data.get('usage')}")
         ai_response = data['choices'][0]['message']['content']
         formatted = convert_markdown_to_html(ai_response)
         # --- Сохраняем новый ответ ---
         last_bot_responses[user_id] = ai_response
+        last_user_message[user_id] = user_text
         response = f"🧠 <b>{escape_html(get_model_name(model_id))}</b>:\n{formatted}"
         if len(response) > 4096:
             for i in range(0, len(response), 4096):
@@ -1211,7 +1248,7 @@ async def handle_message(message: types.Message):
             await try_delete_message(status)
         except Exception:
             pass
-        await message.answer("🚫 Ошибка при обработке запроса")
+        await message.answer("❌ Ошибка при обработке запроса. Попробуйте позже.")
 
 
 # ---------- Run ----------
