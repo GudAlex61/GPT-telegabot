@@ -11,8 +11,10 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command, StateFilter
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import BotCommand, BotCommandScopeDefault
+from aiogram.types import BotCommand, BotCommandScopeDefault, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import LabeledPrice
+from aiogram.filters import Command
 import asyncio
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image
@@ -61,6 +63,8 @@ MODELS_WITH_IMAGE_URL = {
     "openai/gpt-4o-mini",
     "google/gemini-2.0-flash-exp:free"
 }
+
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN")
 
 # Token costs
 TOKEN_COST_TEXT = 1
@@ -594,7 +598,8 @@ async def set_main_menu():
         BotCommand(command="/models", description="Выбрать модель"),
         BotCommand(command="/currentmodel", description="Текущая модель"),
         BotCommand(command="/imagine", description="Создать изображение"),
-        BotCommand(command="/profile", description="Мой профиль")
+        BotCommand(command="/profile", description="Мой профиль"),
+        BotCommand(command="/buy_tokens", description="Докупить токенов")
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -664,6 +669,7 @@ async def cmd_help(m: types.Message):
             "/currentmodel - Текущая модель\n"
             "/imagine - Создание изображения по запросу\n"
             "/profile - Мой профиль\n"
+            "/buy_tokens - Покупка токенов за звёзды\n"
             "<b>Доступные модели:</b>\n"
         )
         for model_name, model_data in AVAILABLE_MODELS.items():
@@ -674,6 +680,135 @@ async def cmd_help(m: types.Message):
         await m.answer("❌ Не удалось показать справку. Пожалуйста, попробуйте позже.")
 
 
+@dp.message(Command("buy_tokens"))
+async def cmd_buy_tokens(message: types.Message):
+    try:
+        user_id = message.from_user.id
+
+        # Создаем клавиатуру с вариантами покупки
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="100 токенов (10 Stars)", callback_data="buy_100"),
+            InlineKeyboardButton(text="500 токенов (40 Stars)", callback_data="buy_500")
+        )
+        builder.row(
+            InlineKeyboardButton(text="1000 токенов (70 Stars)", callback_data="buy_1000"),
+            InlineKeyboardButton(text="Отмена", callback_data="cancel_purchase")
+        )
+
+        await message.answer(
+            "🎁 <b>Выберите пакет токенов:</b>\n\n"
+            "• 100 токенов - 10 Stars\n"
+            "• 500 токенов - 40 Stars\n"
+            "• 1000 токенов - 70 Stars\n\n"
+            "<i>Telegram Stars - это внутренняя валюта Telegram для покупки цифровых товаров.</i>",
+            reply_markup=builder.as_markup()
+        )
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /buy_tokens")
+        await message.answer("❌ Не удалось показать варианты покупки. Попробуйте позже.")
+
+
+@dp.callback_query(F.data.startswith("buy_"))
+async def process_buy_callback(callback: types.CallbackQuery):
+    try:
+        user_id = callback.from_user.id
+        pack_type = callback.data.split("_")[1]
+
+        # Определяем параметры в зависимости от выбранного пакета
+        if pack_type == "100":
+            amount = 1  # 10 Stars в минимальных единицах (1 Star = 100)
+            tokens = 100
+            description = "Пакет из 100 токенов"
+        elif pack_type == "500":
+            amount = 40  # 40 Stars
+            tokens = 500
+            description = "Пакет из 500 токенов"
+        elif pack_type == "1000":
+            amount = 70  # 70 Stars
+            tokens = 1000
+            description = "Пакет из 1000 токенов"
+        else:
+            await callback.answer("Неизвестный пакет")
+            return
+
+        # Отправляем счет
+        await callback.message.delete()
+        await bot.send_invoice(
+            chat_id=user_id,
+            title="Покупка токенов",
+            description=description,
+            payload=f"tokens_{tokens}_{user_id}",
+            currency="XTR",  # Валюта Telegram Stars
+            prices=[LabeledPrice(label=f"{tokens} токенов", amount=amount)],
+            start_parameter="buy_tokens",
+            need_email=False,
+            need_phone_number=False,
+            need_shipping_address=False,
+            is_flexible=False
+        )
+        await callback.answer()
+    except Exception as e:
+        logging.exception("Ошибка в обработчике выбора пакета токенов")
+        await callback.answer("❌ Ошибка при создании счета. Попробуйте позже.", show_alert=True)
+
+@dp.callback_query(F.data == "cancel_purchase")
+async def cancel_purchase(callback: types.CallbackQuery):
+    try:
+        await callback.message.delete()
+        await callback.answer("Покупка отменена")
+    except Exception:
+        await callback.answer()
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(query: types.PreCheckoutQuery):
+    try:
+        # Всегда подтверждаем запрос, если он корректен
+        await bot.answer_pre_checkout_query(query.id, ok=True)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике предварительной проверки платежа")
+        await bot.answer_pre_checkout_query(query.id, ok=False, error_message="Произошла ошибка при обработке платежа")
+
+
+@dp.message(F.content_type == ContentType.SUCCESSFUL_PAYMENT)
+async def process_successful_payment(message: types.Message):
+    try:
+        user_id = message.from_user.id
+        payment_info = message.successful_payment
+
+        # Извлекаем количество токенов из payload
+        payload_parts = payment_info.invoice_payload.split("_")
+        if len(payload_parts) < 3 or payload_parts[0] != "tokens":
+            logging.error(f"Неверный формат payload: {payment_info.invoice_payload}")
+            return
+
+        tokens = int(payload_parts[1])
+        target_user_id = int(payload_parts[2])
+
+        # Проверяем, что платеж предназначен текущему пользователю
+        if target_user_id != user_id:
+            logging.error(f"Несоответствие user_id: {user_id} != {target_user_id}")
+            return
+
+        # Начисляем токены пользователю
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE users SET tokens = tokens + ? WHERE user_id = ?',
+            (tokens, user_id)
+        )
+        conn.commit()
+        conn.close()
+
+        # Отправляем подтверждение
+        await message.answer(
+            f"✅ <b>Оплата прошла успешно!</b>\n"
+            f"На ваш счет зачислено <b>{tokens} токенов</b>.\n"
+            f"Теперь у вас <b>{db_get_user_stats(user_id)['tokens']} токенов</b>."
+        )
+    except Exception as e:
+        logging.exception("Ошибка в обработчике успешного платежа")
+        await message.answer("❌ Произошла ошибка при обработке платежа. Обратитесь к администратору.")
 @dp.message(Command("imagine"))
 async def cmd_imagine(m: types.Message, state: FSMContext):
     try:
