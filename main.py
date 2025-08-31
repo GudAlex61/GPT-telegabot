@@ -58,6 +58,8 @@ IMAGE_QUALITY = int(os.getenv("IMAGE_QUALITY", "90"))  # JPEG quality (1-100)
 TOGETHER_AI_API_KEY = os.getenv("TOGETHER_AI_API_KEY")
 TOGETHER_AI_API_URL = "https://api.together.xyz/v1/images/generations"
 
+STEOS_VOICE_TOKEN = os.getenv("SPEECHIFY_API_KEY")
+
 # Models that accept image_url (IDs)
 MODELS_WITH_IMAGE_URL = {
     "openai/gpt-4o-mini",
@@ -91,8 +93,8 @@ executor = ThreadPoolExecutor(max_workers=4)
 # ---------- FSM States ----------
 class ImageGenState(StatesGroup):
     waiting_for_prompt = State()
-
-
+class VoiceState(StatesGroup):
+    waiting_for_prompt = State()
 # ---------- Models ----------
 AVAILABLE_MODELS = {
     "Deepseek-V3": {"id": "deepseek/deepseek-chat-v3-0324:free", "image_support": False},
@@ -598,6 +600,7 @@ async def set_main_menu():
         BotCommand(command="/models", description="Выбрать модель"),
         BotCommand(command="/currentmodel", description="Текущая модель"),
         BotCommand(command="/imagine", description="Создать изображение"),
+        BotCommand(command="/voice", description="Озвучить любой текст"),
         BotCommand(command="/profile", description="Мой профиль"),
         BotCommand(command="/buy_tokens", description="Докупить токенов")
     ]
@@ -668,6 +671,7 @@ async def cmd_help(m: types.Message):
             "/models - Выбрать модель\n"
             "/currentmodel - Текущая модель\n"
             "/imagine - Создание изображения по запросу\n"
+            "/voice - Озвучить текст"
             "/profile - Мой профиль\n"
             "/buy_tokens - Покупка токенов за звёзды\n"
             "<b>Доступные модели:</b>\n"
@@ -955,7 +959,132 @@ async def handle_image_prompt(m: types.Message, state: FSMContext):
         await m.answer("❌ Не удалось обработать запрос на генерацию изображения. Пожалуйста, попробуйте позже.")
         await state.clear()  # Важно: сбрасываем состояние
 
+@dp.message(Command("voice"))
+async def cmd_voice(m: types.Message, state: FSMContext):
+    try:
+        await state.set_state(VoiceState.waiting_for_prompt)
+        await m.answer(
+            "🎨 Отправьте текстовый запрос для преобразования его в голос. Чтобы выйти из режима, используйте /cancel.")
+    except Exception as e:
+        logging.exception("Ошибка в обработчике /voice")
+        await m.answer("❌ Не удалось активировать режим преобразования текста в голос. Пожалуйста, попробуйте позже.")
 
+@dp.message(StateFilter(VoiceState.waiting_for_prompt), F.text.startswith('/'))
+async def handle_any_command_during_voice(m: types.Message, state: FSMContext):
+    try:
+        await state.clear()
+
+        if m.text.startswith("/cancel"):
+            await m.answer("❌ Режим генерации голоса отменен.")
+            return
+
+        await m.answer("❌ Режим генерации голоса отменен.")
+
+        if m.text.startswith("/start"):
+            await cmd_start(m)
+        elif m.text.startswith("/help"):
+            await cmd_help(m)
+        elif m.text.startswith("/models"):
+            await list_models(m)
+        elif m.text.startswith("/currentmodel"):
+            await current_model(m)
+        elif m.text.startswith("/profile"):
+            await cmd_profile(m)
+        elif m.text.startswith("/imagine"):
+            await cmd_imagine(m, state)
+    except Exception as e:
+        logging.exception("Ошибка в обработчике команды во время ожидания промпта")
+        await m.answer("❌ Не удалось обработать команду. Пожалуйста, попробуйте позже.")
+
+
+@dp.message(StateFilter(VoiceState.waiting_for_prompt))
+async def handle_voice_prompt(m: types.Message, state: FSMContext):
+    try:
+        user_id = m.from_user.id
+        prompt = m.text.strip()
+        print(prompt)
+        if not prompt:
+            return await m.answer("⚠️ Промпт не может быть пустым.")
+
+        if not db_use_tokens(user_id, TOKEN_COST_IMAGE_GEN):
+            stats = db_get_user_stats(user_id)
+            await state.clear()  # Выходим из состояния при ошибке
+            return await m.answer(
+                f"⚠️ Недостаточно токенов для генерации изображения. У вас {stats['tokens']} токенов, требуется {TOKEN_COST_IMAGE_GEN}.")
+
+        await bot.send_chat_action(m.chat.id, "record_voice")
+        status = await m.answer("<i>Генерирую голос...</i>")
+
+        try:
+            # Параметры для API Steos Voice
+            voice_id = 572 # ID голоса (укажите нужный)
+            url = f"https://public.api.voice.steos.io/api/v1/synthesize-controller/synthesis-by-text?authToken={STEOS_VOICE_TOKEN}"
+
+            payload = {
+                "voiceId": voice_id,
+                "text": prompt,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as resp:
+                    logging.info(f"Steos Voice Response Status: {resp.status}")
+                    if resp.status == 200:
+                        try:
+                            data = await resp.json()
+                        except Exception as e:
+                            text_error = await resp.text()
+                            logging.error(
+                                f"Steos Voice returned non-json: status={resp.status} text={text_error[:500]}")
+                            await status.delete()
+                            await state.clear()
+                            return await m.answer("❌ Не удалось обработать ответ от сервера генерации.")
+
+                        # Проверяем наличие аудио данных в ответе
+                        if "fileContents" not in data:
+                            await status.delete()
+                            await state.clear()
+                            return await m.answer("❌ В ответе от сервера отсутствуют аудио данные.")
+
+                        # Декодируем base64 аудио данные
+                        import base64
+                        try:
+                            audio_bytes = base64.b64decode(data["fileContents"])
+                        except Exception as e:
+                            logging.error(f"Base64 decoding error: {e}")
+                            await status.delete()
+                            await state.clear()
+                            return await m.answer("❌ Ошибка декодирования аудио данных.")
+
+                        # Отправляем голосовое сообщение
+                        await bot.send_voice(
+                            chat_id=m.chat.id,
+                            voice=types.BufferedInputFile(
+                                audio_bytes,
+                                filename=f"voice_{user_id}.mp3"
+                            ),
+                            caption="🎵 Ваше сгенерированное голосовое сообщение"
+                        )
+
+                        await status.delete()
+                        await state.clear()
+
+                    else:
+                        error_text = await resp.text()
+                        logging.error(f"Steos Voice API error: {resp.status} - {error_text}")
+                        await status.delete()
+                        await state.clear()
+                        return await m.answer(f"❌ Ошибка генерации голоса. Код: {resp.status}")
+
+        except Exception as e:
+            logging.error(f"Request error: {e}")
+            await status.delete()
+            await state.clear()
+            return await m.answer("❌ Ошибка при обращении к серверу генерации голоса.")
+
+    except Exception as e:
+        logging.error(f"Unexpected error in handle_voice_prompt: {e}")
+        await state.clear()
+        return await m.answer("❌ Непредвиденная ошибка при обработке запроса.")
 @dp.message(Command("cancel"))
 async def cmd_cancel(m: types.Message):
     pass
